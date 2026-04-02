@@ -1,0 +1,146 @@
+import cv2
+import numpy as np
+import glob
+import os
+import re
+
+def extract_num(p):
+    m = re.search(r"(\d+)", os.path.basename(p))
+    return int(m.group(1)) if m else 0
+
+def extract_single_waypoint(img):
+    hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+    l = hls[:, :, 1]
+    s = hls[:, :, 2]
+    sobelx = cv2.Sobel(l, cv2.CV_64F, 1, 0, ksize=5)
+    abs_sobel = np.absolute(sobelx)
+    scaled = np.uint8(255 * abs_sobel / np.max(abs_sobel))
+    sxbin = np.zeros_like(scaled)
+    sxbin[(scaled >= 30) & (scaled <= 255)] = 255
+    sbin = np.zeros_like(s)
+    sbin[(s >= 150) & (s <= 255)] = 255
+    binary = cv2.bitwise_or(sxbin, sbin)
+    hist = np.sum(binary[binary.shape[0] // 2:, :], axis=0)
+    mid = hist.shape[0] // 2
+    lx = np.argmax(hist[:mid])
+    rx = np.argmax(hist[mid:]) + mid
+    h = binary.shape[0]
+    nw = 9
+    margin = 150
+    minpix = 20
+    wh = h // nw
+    nz = binary.nonzero()
+    nz_y = np.array(nz[0])
+    nz_x = np.array(nz[1])
+    cl = lx
+    cr = rx
+    linds = []
+    rinds = []
+    for w in range(nw):
+        wy0 = h - (w + 1) * wh
+        wy1 = h - w * wh
+        wl0 = cl - margin
+        wl1 = cl + margin
+        wr0 = cr - margin
+        wr1 = cr + margin
+        goodl = ((nz_y >= wy0) & (nz_y < wy1) & (nz_x >= wl0) & (nz_x < wl1)).nonzero()[0]
+        goodr = ((nz_y >= wy0) & (nz_y < wy1) & (nz_x >= wr0) & (nz_x < wr1)).nonzero()[0]
+        linds.append(goodl)
+        rinds.append(goodr)
+        if len(goodl) > minpix:
+            cl = int(np.mean(nz_x[goodl]))
+        if len(goodr) > minpix:
+            cr = int(np.mean(nz_x[goodr]))
+    linds = np.concatenate(linds)
+    rinds = np.concatenate(rinds)
+    lxv = nz_x[linds]
+    lyv = nz_y[linds]
+    rxv = nz_x[rinds]
+    ryv = nz_y[rinds]
+    if len(lxv) < 50 or len(rxv) < 50:
+        return None
+    lf = np.polyfit(lyv, lxv, 2)
+    rf = np.polyfit(ryv, rxv, 2)
+    ploty = np.linspace(0, h - 1, h)
+    lfx = lf[0] * ploty**2 + lf[1] * ploty + lf[2]
+    rfx = rf[0] * ploty**2 + rf[1] * ploty + rf[2]
+    cx = (lfx[-1] + rfx[-1]) / 2
+    cy = ploty[-1]
+    return np.array([cx, cy])
+
+def get_road_mask(img):
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 0, 80]), np.array([180, 55, 220]))
+    roi = np.zeros((h, w), np.uint8)
+    pts = np.array([[(int(w*0.05), h), (int(w*0.95), h),
+                     (int(w*0.75), int(h*0.45)), (int(w*0.25), int(h*0.45))]])
+    cv2.fillPoly(roi, pts, 255)
+    return cv2.bitwise_and(mask, roi)
+
+def close_loop(p, t=40):
+    if len(p) < 5:
+        return p
+    if np.linalg.norm(p[0] - p[-1]) < t:
+        return p
+    return np.vstack([p, p[0]])
+
+def create_track_video(folder, output="track_map.avi"):
+    files = []
+    for e in ["*.jpg", "*.jpeg", "*.png"]:
+        files.extend(glob.glob(os.path.join(folder, e)))
+    files = sorted(files, key=extract_num)
+    if not files:
+        return
+    pts = []
+    for f in files:
+        img = cv2.imread(f)
+        wp = extract_single_waypoint(img)
+        if wp is not None:
+            pts.append(wp)
+    if not pts:
+        return
+    pts = np.array(pts, dtype=float)
+    pts -= pts.min(axis=0)
+    scale = 900.0 / np.ptp(pts, axis=0).max()
+    pts *= scale
+    pts = close_loop(pts)
+    pts = pts.astype(int)
+    base = cv2.imread(files[0])
+    hc, wc = base.shape[:2]
+    wm = 1000
+    hm = 600
+    H = max(hc, hm)
+    W = wc + wm
+    wr = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*"XVID"), 20, (W, H))
+    idx = 0
+    for f in files:
+        img = cv2.imread(f)
+        mask = get_road_mask(img)
+        mask3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        g = np.zeros_like(mask3)
+        g[:, :, 1] = 180
+        o = img.copy()
+        o[mask > 0] = o[mask > 0] * 0.4 + g[mask > 0] * 0.6
+        mapimg = np.zeros((hm, wm, 3), np.uint8)
+        for i in range(1, len(pts)):
+            cv2.line(mapimg, tuple(pts[i - 1]), tuple(pts[i]), (80, 80, 80), 12)
+        n = min(idx, len(pts))
+        for i in range(1, n):
+            cv2.line(mapimg, tuple(pts[i - 1]), tuple(pts[i]), (0, 220, 0), 10)
+        if idx < len(pts):
+            cx, cy = pts[idx]
+        else:
+            cx, cy = pts[-1]
+        cv2.circle(mapimg, (cx, cy), 12, (0, 255, 255), -1)
+        frame = np.zeros((H, W, 3), np.uint8)
+        frame[:hc, :wc] = o
+        frame[:hm, wc:wc + wm] = mapimg
+        wr.write(frame)
+        idx += 1
+    wr.release()
+
+if __name__ == "__main__":
+    import sys
+    folder = sys.argv[1] if len(sys.argv) > 1 else "images"
+    create_track_video(folder)

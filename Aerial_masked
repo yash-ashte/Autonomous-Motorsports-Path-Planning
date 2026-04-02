@@ -1,0 +1,171 @@
+import cv2
+import numpy as np
+import glob
+import os
+import re
+from collections import deque
+
+
+def extract_num(path):
+    m = re.search(r"(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else 0
+
+
+def load_mask(mask_path):
+    img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    _, bw = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY)
+    h, w = bw.shape
+    bw[int(h * 0.85):, :] = 0
+    return bw
+
+
+def get_edges(mask):
+    blur = cv2.GaussianBlur(mask, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 110)
+    h = edges.shape[0]
+    edges[:int(h * 0.45)] = 0
+    edges[int(h * 0.95):] = 0
+    return edges
+
+
+def compute_center_offset(edges):
+    h, w = edges.shape
+    y_start = int(h * 0.55)
+    ys = np.arange(y_start, h, 6)
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for y in ys:
+        xs = np.where(edges[y] > 0)[0]
+        if len(xs) < 2:
+            continue
+        center = (xs[0] + xs[-1]) / 2.0
+        proximity = (y - y_start) / max(h - y_start, 1)
+        weight = 1.0 + 3.0 * proximity
+        weighted_sum += center * weight
+        weight_total += weight
+    if weight_total == 0:
+        return None
+    mean_center = weighted_sum / weight_total
+    return (mean_center - w / 2) / (w / 2)
+
+
+def compute_bias(mask_files):
+    all_offsets = []
+    for mf in mask_files:
+        mask = load_mask(mf)
+        edges = get_edges(mask)
+        offset = compute_center_offset(edges)
+        if offset is not None:
+            all_offsets.append(offset)
+    return float(np.mean(all_offsets)) if all_offsets else 0.0
+
+
+def close_track_loop(points):
+    if len(points) < 10:
+        return points
+    search_from = int(len(points) * 0.7)
+    dists = np.linalg.norm(points[search_from:] - points[0], axis=1)
+    closest_idx = search_from + np.argmin(dists)
+    tail = points[closest_idx:]
+    for i in range(len(tail)):
+        alpha = i / max(len(tail) - 1, 1)
+        points[closest_idx + i] = tail[i] * (1 - alpha) + points[0] * alpha
+    return np.vstack([points[:closest_idx + 1], points[0]])
+
+def create_track_video(images_folder, masks_folder, output="track_map.avi"):
+    img_files = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        img_files.extend(glob.glob(os.path.join(images_folder, ext)))
+    img_files = sorted(img_files, key=extract_num)
+
+    mask_files = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        mask_files.extend(glob.glob(os.path.join(masks_folder, ext)))
+    mask_files = sorted(mask_files, key=extract_num)
+
+    if not img_files or not mask_files:
+        print("No images or masks found.")
+        return
+
+    print("Computing offset bias...")
+    bias = compute_bias(mask_files)
+    print(f"Bias: {bias:.4f}")
+
+    x, y = 0.0, 0.0
+    heading = 0.0
+    pts = []
+    steering_buf = deque(maxlen=5)
+
+    for mf in mask_files:
+        mask = load_mask(mf)
+        edges = get_edges(mask)
+        offset = compute_center_offset(edges)
+        corrected = (offset - bias) * 0.29 if offset is not None else 0.0
+        steering_buf.append(corrected)
+        heading += np.mean(steering_buf)
+        x += np.cos(heading)
+        y += np.sin(heading)
+        pts.append([x, y])
+
+    pts = np.array(pts)
+    pts = close_track_loop(pts)
+    pts -= pts.min(axis=0)
+    scale = 500.0 / np.ptp(pts, axis=0).max()
+    pts = (pts * scale).astype(int)
+
+    w_map, h_map = 800, 500
+    pts[:, 0] = int(w_map * 0.9) - pts[:, 0]
+
+    sample = cv2.imread(img_files[0])
+    h_cam, w_cam = sample.shape[:2]
+    H = max(h_cam, h_map)
+    W = w_cam + w_map
+
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(output, fourcc, 20, (W, H))
+
+    for i, (f, mf) in enumerate(zip(img_files, mask_files)):
+        img = cv2.imread(f)
+        mask = load_mask(mf)
+        edges = get_edges(mask)
+
+        mask_3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        green = np.zeros_like(mask_3)
+        green[:, :, 1] = 180
+        overlay = img.copy()
+        overlay[mask > 0] = overlay[mask > 0] * 0.4 + green[mask > 0] * 0.6
+
+        offset = compute_center_offset(edges)
+        if offset is not None:
+            cx_cam = int((offset + 1) / 2 * w_cam)
+            cv2.line(overlay, (cx_cam, h_cam - 10), (w_cam // 2, h_cam - 10), (0, 255, 255), 3)
+            cv2.circle(overlay, (cx_cam, h_cam - 10), 7, (0, 100, 255), -1)
+
+        map_img = np.zeros((h_map, w_map, 3), dtype=np.uint8)
+        for j in range(1, len(pts)):
+            cv2.line(map_img, tuple(pts[j - 1]), tuple(pts[j]), (80, 80, 80), 12)
+        for j in range(1, min(i + 1, len(pts))):
+            cv2.line(map_img, tuple(pts[j - 1]), tuple(pts[j]), (0, 220, 0), 10)
+
+        idx = min(i, len(pts) - 1)
+        cx, cy = pts[idx]
+        cv2.circle(map_img, (cx, cy), 12, (0, 255, 255), -1)
+        hx = int(cx + 40 * np.cos(heading))
+        hy = int(cy + 40 * np.sin(heading))
+        cv2.line(map_img, (cx, cy), (hx, hy), (255, 255, 255), 4)
+
+        frame = np.zeros((H, W, 3), dtype=np.uint8)
+        frame[:h_cam, :w_cam] = overlay
+        frame[:h_map, w_cam:w_cam + w_map] = map_img
+        writer.write(frame)
+        print(f"Frame {i+1}/{len(img_files)}")
+
+    writer.release()
+    print(f"Saved video -> {output}")
+
+
+if __name__ == "__main__":
+    import sys
+    images_folder = sys.argv[1] if len(sys.argv) > 1 else "images"
+    masks_folder = sys.argv[2] if len(sys.argv) > 2 else "masks"
+    create_track_video(images_folder, masks_folder)
