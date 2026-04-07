@@ -5,28 +5,33 @@ import os
 import re
 from collections import deque
 
+try:
+    from scipy.ndimage import gaussian_filter1d
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 
 def extract_num(path):
     m = re.search(r"(\d+)", os.path.basename(path))
     return int(m.group(1)) if m else 0
 
-
 def load_mask(mask_path):
     img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if img is None: return np.zeros((100,100), dtype=np.uint8)
     _, bw = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY)
     h, w = bw.shape
+    # Mask out the hood/dash and the sky
     bw[int(h * 0.85):, :] = 0
     return bw
-
 
 def get_edges(mask):
     blur = cv2.GaussianBlur(mask, (5, 5), 0)
     edges = cv2.Canny(blur, 40, 110)
     h = edges.shape[0]
+    # Focus only on the drivable road area
     edges[:int(h * 0.45)] = 0
     edges[int(h * 0.95):] = 0
     return edges
-
 
 def compute_center_offset(edges):
     h, w = edges.shape
@@ -39,133 +44,171 @@ def compute_center_offset(edges):
         if len(xs) < 2:
             continue
         center = (xs[0] + xs[-1]) / 2.0
+        # Weight points closer to the bottom more for immediate steering
         proximity = (y - y_start) / max(h - y_start, 1)
         weight = 1.0 + 3.0 * proximity
         weighted_sum += center * weight
         weight_total += weight
+    
     if weight_total == 0:
         return None
     mean_center = weighted_sum / weight_total
     return (mean_center - w / 2) / (w / 2)
 
-
-def compute_bias(mask_files):
+def compute_sector_biases(mask_files, n_sectors=10):
     all_offsets = []
     for mf in mask_files:
         mask = load_mask(mf)
         edges = get_edges(mask)
         offset = compute_center_offset(edges)
-        if offset is not None:
-            all_offsets.append(offset)
-    return float(np.mean(all_offsets)) if all_offsets else 0.0
+        all_offsets.append(offset)
 
+    valid = [o for o in all_offsets if o is not None]
+    if not valid:
+        return all_offsets, [0.0] * len(mask_files)
+
+    global_mean = float(np.mean(valid))
+    n = len(mask_files)
+    sector_size = max(1, n // n_sectors)
+    raw_sector_biases = []
+
+    for s in range(n_sectors):
+        start = s * sector_size
+        end = start + sector_size if s < n_sectors - 1 else n
+        sector_offsets = [o for o in all_offsets[start:end] if o is not None]
+        if sector_offsets:
+            raw_sector_biases.append(float(np.mean(sector_offsets)) - global_mean)
+        else:
+            raw_sector_biases.append(0.0)
+
+    if HAS_SCIPY:
+        smoothed = gaussian_filter1d(raw_sector_biases, sigma=1.0).tolist()
+    else:
+        smoothed = raw_sector_biases[:] # Simple box blur fallback could be added here
+
+    per_frame_biases = []
+    for i in range(n):
+        sector_idx = min(i * n_sectors // n, n_sectors - 1)
+        per_frame_biases.append(smoothed[sector_idx])
+
+    return all_offsets, per_frame_biases
 
 def close_track_loop(points):
     if len(points) < 10:
         return points
+    # Find where the path tries to meet itself
     search_from = int(len(points) * 0.7)
     dists = np.linalg.norm(points[search_from:] - points[0], axis=1)
     closest_idx = search_from + np.argmin(dists)
+    
     tail = points[closest_idx:]
+    new_points = points[:closest_idx].tolist()
+    
+    # Smoothly interpolate the tail back to the start
     for i in range(len(tail)):
         alpha = i / max(len(tail) - 1, 1)
-        points[closest_idx + i] = tail[i] * (1 - alpha) + points[0] * alpha
-    return np.vstack([points[:closest_idx + 1], points[0]])
+        blended = tail[i] * (1 - alpha) + points[0] * alpha
+        new_points.append(blended)
+    
+    new_points.append(points[0])
+    return np.array(new_points)
 
-def create_track_video(images_folder, masks_folder, output="track_map.avi"):
-    img_files = []
-    for ext in ["*.jpg", "*.jpeg", "*.png"]:
-        img_files.extend(glob.glob(os.path.join(images_folder, ext)))
-    img_files = sorted(img_files, key=extract_num)
-
-    mask_files = []
-    for ext in ["*.jpg", "*.jpeg", "*.png"]:
-        mask_files.extend(glob.glob(os.path.join(masks_folder, ext)))
-    mask_files = sorted(mask_files, key=extract_num)
+def create_track_video(images_folder, masks_folder, output="track_map.avi", n_sectors=10):
+    img_files = sorted(glob.glob(os.path.join(images_folder, "*.*")), key=extract_num)
+    mask_files = sorted(glob.glob(os.path.join(masks_folder, "*.*")), key=extract_num)
 
     if not img_files or not mask_files:
         print("No images or masks found.")
         return
 
-    print("Computing offset bias...")
-    bias = compute_bias(mask_files)
-    print(f"Bias: {bias:.4f}")
+    print(f"Analyzing {len(mask_files)} frames...")
+    all_offsets, per_frame_biases = compute_sector_biases(mask_files, n_sectors)
 
     x, y = 0.0, 0.0
     heading = 0.0
     pts = []
-    steering_buf = deque(maxlen=5)
+    steering_buf = deque(maxlen=3) # Shorter buffer for more responsive turns
 
-    for mf in mask_files:
-        mask = load_mask(mf)
-        edges = get_edges(mask)
-        offset = compute_center_offset(edges)
-        corrected = (offset - bias) * 0.29 if offset is not None else 0.0
+    for i, offset in enumerate(all_offsets):
+        bias = per_frame_biases[i]
+        
+        if offset is not None:
+            raw_val = offset - bias
+            # IMPROVEMENT: Power scaling for tighter turns
+            # This makes the hairpins sharper like the reference image
+            corrected = np.sign(raw_val) * (abs(raw_val) ** 1.3) * 0.32
+        else:
+            corrected = 0.0
+            
         steering_buf.append(corrected)
-        heading += np.mean(steering_buf)
-        x += np.cos(heading)
-        y += np.sin(heading)
+        turn_rate = np.mean(steering_buf)
+        heading += turn_rate
+        
+        # IMPROVEMENT: Dynamic Speed
+        # Slow down during turns to prevent "wide" corners
+        speed = 1.0 - (abs(turn_rate) * 1.5)
+        speed = max(0.4, speed) 
+        
+        x += speed * np.cos(heading)
+        y += speed * np.sin(heading)
         pts.append([x, y])
 
     pts = np.array(pts)
     pts = close_track_loop(pts)
+    
+    # Scaling and Centering for visualization
     pts -= pts.min(axis=0)
-    scale = 500.0 / np.ptp(pts, axis=0).max()
+    scale = 420.0 / np.ptp(pts, axis=0).max()
     pts = (pts * scale).astype(int)
-
-    w_map, h_map = 800, 500
-    pts[:, 0] = int(w_map * 0.9) - pts[:, 0]
+    
+    # Adjust orientation to match satellite view
+    w_map, h_map = 800, 600
+    pts[:, 0] = (w_map - 50) - pts[:, 0]
+    pts += 40 
 
     sample = cv2.imread(img_files[0])
     h_cam, w_cam = sample.shape[:2]
-    H = max(h_cam, h_map)
-    W = w_cam + w_map
+    H, W = max(h_cam, h_map), w_cam + w_map
 
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    writer = cv2.VideoWriter(output, fourcc, 20, (W, H))
+    writer = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*"XVID"), 30, (W, H))
 
     for i, (f, mf) in enumerate(zip(img_files, mask_files)):
         img = cv2.imread(f)
         mask = load_mask(mf)
-        edges = get_edges(mask)
-
-        mask_3 = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        green = np.zeros_like(mask_3)
-        green[:, :, 1] = 180
+        
+        # UI Overlay for Camera
         overlay = img.copy()
-        overlay[mask > 0] = overlay[mask > 0] * 0.4 + green[mask > 0] * 0.6
+        overlay[mask > 0] = cv2.addWeighted(overlay[mask > 0], 0.4, 
+                                           np.full_like(overlay[mask > 0], (0, 180, 0)), 0.6, 0)
 
-        offset = compute_center_offset(edges)
-        if offset is not None:
-            cx_cam = int((offset + 1) / 2 * w_cam)
-            cv2.line(overlay, (cx_cam, h_cam - 10), (w_cam // 2, h_cam - 10), (0, 255, 255), 3)
-            cv2.circle(overlay, (cx_cam, h_cam - 10), 7, (0, 100, 255), -1)
-
+        # Map drawing
         map_img = np.zeros((h_map, w_map, 3), dtype=np.uint8)
-        for j in range(1, len(pts)):
-            cv2.line(map_img, tuple(pts[j - 1]), tuple(pts[j]), (80, 80, 80), 12)
-        for j in range(1, min(i + 1, len(pts))):
-            cv2.line(map_img, tuple(pts[j - 1]), tuple(pts[j]), (0, 220, 0), 10)
+        # Draw the "ghost" of the full track
+        cv2.polylines(map_img, [pts], False, (40, 40, 40), 12, cv2.LINE_AA)
+        
+        # Draw the driven path
+        curr_idx = min(i, len(pts)-1)
+        if curr_idx > 1:
+            cv2.polylines(map_img, [pts[:curr_idx]], False, (0, 255, 0), 8, cv2.LINE_AA)
 
-        idx = min(i, len(pts) - 1)
-        cx, cy = pts[idx]
-        cv2.circle(map_img, (cx, cy), 12, (0, 255, 255), -1)
-        hx = int(cx + 40 * np.cos(heading))
-        hy = int(cy + 40 * np.sin(heading))
-        cv2.line(map_img, (cx, cy), (hx, hy), (255, 255, 255), 4)
+        # Current Position Marker
+        cx, cy = pts[curr_idx]
+        cv2.circle(map_img, (cx, cy), 10, (0, 255, 255), -1)
 
-        frame = np.zeros((H, W, 3), dtype=np.uint8)
-        frame[:h_cam, :w_cam] = overlay
-        frame[:h_map, w_cam:w_cam + w_map] = map_img
-        writer.write(frame)
-        print(f"Frame {i+1}/{len(img_files)}")
+        # Combine into one frame
+        final_frame = np.zeros((H, W, 3), dtype=np.uint8)
+        final_frame[:h_cam, :w_cam] = overlay
+        final_frame[:h_map, w_cam:] = map_img
+        
+        writer.write(final_frame)
+        if i % 50 == 0: print(f"Processing frame {i}")
 
     writer.release()
-    print(f"Saved video -> {output}")
-
+    print(f"Success! Video saved to {output}")
 
 if __name__ == "__main__":
+    # Usage: python script.py images_folder masks_folder 5 output.avi
     import sys
-    images_folder = sys.argv[1] if len(sys.argv) > 1 else "images"
-    masks_folder = sys.argv[2] if len(sys.argv) > 2 else "masks"
-    create_track_video(images_folder, masks_folder)
+    img_dir = sys.argv[1] if len(sys.argv) > 1 else "images"
+    msk_dir = sys.argv[2] if len(sys.argv) > 2 else "masks"
+    create_track_video(img_dir, msk_dir, n_sectors=5)
